@@ -1,0 +1,5 @@
+streamlit>=1.36
+yt-dlp
+requests
+requests-toolbelt
+imageio-ffmpeg
