@@ -193,9 +193,14 @@ def download_video(video, fmt="mp4", log=None):
     if log:
         log(f"⬇️  Mengunduh: {target} ({fmt}) ...")
     base = ["--no-warnings", "--newline", "--progress-delta", "2",
+            "--retries", "3", "--fragment-retries", "3",
             "-o", f"{WORK}/%(title)s.%(ext)s"]
     if FFMPEG:
         base += ["--ffmpeg-location", FFMPEG]
+    # cookies YouTube opsional (env YT_COOKIES_FILE) — membantu saat IP diblokir
+    ck = os.environ.get("YT_COOKIES_FILE", "")
+    if ck and os.path.exists(ck):
+        base += ["--cookies", ck]
 
     def want(line):
         # buang baris progress berulang (999 baris %), simpan yang penting & garis 100%
@@ -204,21 +209,58 @@ def download_video(video, fmt="mp4", log=None):
             return False
         return True
 
+    def once(extra, label=None):
+        if label and log:
+            log("🧪 " + label + " ...")
+        run(base + extra + [target], log=log, stream=True, want=want)
+
     if fmt == "mp3":
-        run(base + ["-x", "--audio-format", "mp3", "--audio-quality", "0", target],
-            log=log, stream=True, want=want)
-    else:
         try:
-            run(base + ["-f", "bv*[height<=1080]+ba/b[height<=1080]/b",
-                        "--merge-output-format", "mp4", target],
-                log=log, stream=True, want=want)
+            once(["-x", "--audio-format", "mp3", "--audio-quality", "0",
+                  "-f", "ba[protocol^=https]/ba/bestaudio/b"], "MP3: DASH https")
         except RuntimeError:
-            # fallback: unduh format tunggal (tanpa perlu merge) agar tetap jalan
             cleanup_work(log)
-            if log:
-                log("⚠️ Merge gagal — fallback ke format tunggal (tanpa penggabungan)...")
-            run(base + ["-f", "bv*[height<=1080]/b[height<=1080]/b", target],
-                log=log, stream=True, want=want)
+            once(["-x", "--audio-format", "mp3", "--audio-quality", "0"],
+                 "MP3: format default")
+    else:
+        # STRATEGI BERLAPIS — YouTube sering membalas "403 Forbidden" untuk fragmen
+        # HLS (m3u8) dari IP hosting cloud (Streamlit/GCP, VPS). Urutan strategi
+        # berdasarkan uji empiris; yang pertama berhasil dipakai:
+        #  1) format default yt-dlp            (paling kompatibel)
+        #  2) DASH https saja                  (memotong jalur HLS → lolos blokir 403)
+        #  3) client android                   (jalur penandatanganan beda)
+        #  4) client web_embedded, format 18   (progresif, tanpa merge)
+        #  5) client android_vr, format 18     (cadangan terakhir)
+        plans = [
+            ("format default",
+             ["-f", "bv*[height<=1080]+ba/b[height<=1080]/b",
+              "--merge-output-format", "mp4"]),
+            ("DASH https (hindari HLS)",
+             ["-f", "bv*[protocol^=https]+ba[protocol^=https]/b[protocol^=https]/b",
+              "--merge-output-format", "mp4"]),
+            ("client android",
+             ["-f", "bv*[height<=1080]+ba/b[height<=1080]/b",
+              "--merge-output-format", "mp4",
+              "--extractor-args", "youtube:player_client=android"]),
+            ("client web_embedded (format 18)",
+             ["-f", "18/22/b",
+              "--extractor-args", "youtube:player_client=web_embedded"]),
+            ("client android_vr (format 18)",
+             ["-f", "18/b",
+              "--extractor-args", "youtube:player_client=android_vr"]),
+        ]
+        errs = []
+        for i, (label, extra) in enumerate(plans):
+            try:
+                once(extra, label)
+                break
+            except RuntimeError as e:
+                errs.append(f"{i+1}. {label}: {e}")
+                cleanup_work(log)
+        else:
+            raise RuntimeError(
+                "Semua strategi download gagal (kemungkinan IP hosting diblokir YouTube):\n- "
+                + "\n- ".join(errs[-5:]))
 
     files = [os.path.join(WORK, f) for f in os.listdir(WORK)
              if f.endswith((".mp4", ".mp3", ".webm", ".m4a", ".mkv"))]
