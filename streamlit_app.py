@@ -73,6 +73,11 @@ try:
               "BLOGGER_REFRESH_TOKEN", "BLOGGER_BLOG_ID"):
         if k.lower() in st.secrets:
             os.environ[k] = str(st.secrets[k.lower()]).strip()
+    # Opsi 5: relay unduhan via Cloudflare Worker (bypass 403 YouTube dari IP hosting)
+    if "yt_fetch_proxy" in st.secrets:
+        os.environ["YT_FETCH_PROXY"] = str(st.secrets["yt_fetch_proxy"]).strip()
+    if "yt_force_proxy" in st.secrets and str(st.secrets["yt_force_proxy"]).strip() in ("1", "true", "True"):
+        os.environ["YT_FORCE_PROXY"] = "1"
 except Exception:
     pass
 
