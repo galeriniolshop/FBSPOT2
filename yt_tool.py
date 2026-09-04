@@ -23,6 +23,9 @@ import tempfile
 import time
 
 import requests
+from urllib.parse import urljoin
+
+from yt_dlp import YoutubeDL
 
 YP = "yt-dlp"
 WORK = os.environ.get("YT_WORK_DIR", "/home/user/.ytwork")   # bisa di-override (mis. /tmp di cloud)
@@ -52,6 +55,13 @@ SUBSCRIBE_ALIAS = os.environ.get("SUBSCRIBE_ALIAS", "ytsubscribe")
 # ganti browser, dan bisa ditulis dari UI. Kosongkan untuk mode file-lokal saja.
 FEBSPOT_SYNC_URL = os.environ.get("FEBSPOT_SYNC_URL", "")
 FEBSPOT_SYNC_TOKEN = os.environ.get("FEBSPOT_SYNC_TOKEN", "")
+
+# ---------- relay unduhan via Cloudflare Worker (fragmen YouTube 403 dari IP cloud) ----------
+# Isi YT_FETCH_PROXY (mis. https://ytfetch.xxx.workers.dev) → bila strategi unduh
+# normal kena 403, mesin otomatis menarik fragmen media lewat worker (IP Cloudflare
+# umumnya tidak diblokir YouTube). Bisa dipaksa lebih dulu dengan YT_FORCE_PROXY=1.
+FETCH_PROXY = os.environ.get("YT_FETCH_PROXY", "").rstrip("/")
+FORCE_PROXY = os.environ.get("YT_FORCE_PROXY", "") == "1"
 
 
 def find_ffmpeg():
@@ -250,6 +260,9 @@ def download_video(video, fmt="mp4", log=None):
               "--extractor-args", "youtube:player_client=android_vr"]),
         ]
         errs = []
+        if FORCE_PROXY and proxy_enabled():
+            # mode paksa: relay dulu (IP tertentu langsung diblokir)
+            return download_via_relay(target, log=log)
         for i, (label, extra) in enumerate(plans):
             try:
                 once(extra, label)
@@ -258,15 +271,215 @@ def download_video(video, fmt="mp4", log=None):
                 errs.append(f"{i+1}. {label}: {e}")
                 cleanup_work(log)
         else:
+            # strategi terakhir: relay lewat Cloudflare Worker (IP non-blokir)
+            if proxy_enabled() and log:
+                log("☁️ Semua strategi gagal — mencoba RELAY CLOUDFLARE ...")
+            if proxy_enabled():
+                return download_via_relay(target, log=log)
             raise RuntimeError(
-                "Semua strategi download gagal (kemungkinan IP hosting diblokir YouTube):\n- "
-                + "\n- ".join(errs[-5:]))
+                "Semua strategi download gagal (kemungkinan IP hosting diblokir YouTube).\n- "
+                + "\n- ".join(errs[-5:])
+                + "\n💡 Atur YT_FETCH_PROXY (Cloudflare Worker relay) untuk unduh via IP Cloudflare.")
 
     files = [os.path.join(WORK, f) for f in os.listdir(WORK)
              if f.endswith((".mp4", ".mp3", ".webm", ".m4a", ".mkv"))]
     if not files:
         raise RuntimeError("File hasil download tidak ditemukan.")
     return max(files, key=os.path.getsize)
+
+
+# ---------------- UNDUH via RELAY CLOUDFLARE (fallback 403) ----------------
+def proxy_enabled():
+    return bool(FETCH_PROXY)
+
+
+def _proxy_get(url, log=None, headers=None, timeout=120):
+    """Ambil byte via worker relay: GET {PROXY}/?url=<encoded>."""
+    if not FETCH_PROXY:
+        raise RuntimeError("YT_FETCH_PROXY belum diatur.")
+    r = requests.get(FETCH_PROXY + "/", params={"url": url},
+                     headers=headers or {}, timeout=timeout, stream=True)
+    if r.status_code != 200:
+        raise RuntimeError(f"Relay {r.status_code} untuk {url[:80]}")
+    data = r.content
+    if log:
+        log(f"   ☁️ relay: {len(data)//1024} KB dari {url[:60]}...")
+    return data
+
+
+def _proxy_stream(url, path, log=None, headers=None, timeout=600):
+    """Unduh (streaming) satu URL melalui relay ke file."""
+    if not FETCH_PROXY:
+        raise RuntimeError("YT_FETCH_PROXY belum diatur.")
+    r = requests.get(FETCH_PROXY + "/", params={"url": url},
+                     headers=headers or {}, timeout=timeout, stream=True)
+    if r.status_code != 200:
+        raise RuntimeError(f"Relay {r.status_code} untuk {url[:80]}")
+    total = 0
+    with open(path, "wb") as f:
+        for chunk in r.iter_content(chunk_size=1 << 16):
+            f.write(chunk)
+            total += len(chunk)
+    if log:
+        log(f"   ☁️ relay: {total//1024} KB → {os.path.basename(path)}")
+    return total
+
+
+def _parse_m3u8(text, base_url):
+    """Ambil EXT-X-MAP (init) + daftar URL segmen dari playlist HLS."""
+    init = None
+    segs = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("#EXT-X-MAP:"):
+            m = re.search(r'URI="([^"]+)"', line)
+            if m:
+                init = urljoin(base_url, m.group(1))
+        elif line.startswith("#"):
+            continue
+        else:
+            segs.append(urljoin(base_url, line))
+    return init, segs
+
+
+def _pull_format(fmt, label, log=None):
+    """Unduh satu format (HLS playlist / DASH fragments / URL tunggal) via relay ke file."""
+    url = fmt.get("url") or fmt.get("manifest_url")
+    if not url:
+        raise RuntimeError("Format tidak punya URL.")
+    frags = fmt.get("fragments") or []
+    is_m3u8 = (fmt.get("protocol") in ("m3u8", "m3u8_native")
+               or str(url).endswith(".m3u8"))
+    out = os.path.join(WORK, f"relay_{label}.bin")
+    with open(out, "wb") as f:
+        if is_m3u8:
+            if log:
+                log(f"   ☁️ HLS: ambil manifest {url[:70]}...")
+            manifest = _proxy_get(url, log=log).decode("utf-8", "replace")
+            init, segs = _parse_m3u8(manifest, url)
+            if not segs:
+                raise RuntimeError("Playlist HLS tidak berisi segmen.")
+            if log:
+                log(f"   ☁️ HLS: {len(segs)} segmen" + (" (+init)" if init else ""))
+            if init:
+                f.write(_proxy_get(init, log=None))
+            for i, s in enumerate(segs, 1):
+                for attempt in range(3):
+                    try:
+                        data = _proxy_get(s, log=None)
+                        break
+                    except Exception:
+                        if attempt == 2:
+                            raise
+                f.write(data)
+                if log and (i % 20 == 0 or i == len(segs)):
+                    log(f"   ☁️ HLS: {i}/{len(segs)} segmen...")
+        else:
+            # DASH fragments (Range) atau URL tunggal
+            if frags:
+                for i, fr in enumerate(frags, 1):
+                    furl = fr.get("url") or url
+                    headers = {}
+                    if fr.get("range"):
+                        headers["Range"] = f"bytes={fr['range']}"
+                    f.write(_proxy_get(furl, log=None, headers=headers))
+                    if log and i % 20 == 0:
+                        log(f"   ☁️ DASH: {i}/{len(frags)} fragmen...")
+            else:
+                if log:
+                    log(f"   ☁️ unduh URL tunggal {url[:70]}...")
+                f.write(_proxy_get(url, log=log, timeout=600))
+    return out, os.path.getsize(out)
+
+
+def _relay_finish(vfile, afile, final_path, log=None):
+    """Gabung video+audio hasil relay pakai ffmpeg (repair + merge ke mp4)."""
+    cmd = [FFMPEG, "-y", "-i"]
+    if vfile and afile:
+        cmd += [vfile, "-i", afile]
+    else:
+        cmd += [vfile or afile]
+    cmd += ["-c", "copy", "-movflags", "+faststart", final_path]
+    if log:
+        log("   🎞️ merge (ffmpeg) via relay...")
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    if p.returncode != 0:
+        # coba remux terpisah (mungkin konflik codec): fallback ke stream video saja
+        if log:
+            log("   ⚠️ merge gagal — pakai stream video saja.")
+        p = subprocess.run([FFMPEG, "-y", "-i", vfile or afile,
+                            "-c", "copy", "-movflags", "+faststart", final_path],
+                           capture_output=True, text=True, timeout=1800)
+        if p.returncode != 0:
+            raise RuntimeError("ffmpeg gagal memproses hasil relay: " + (p.stderr or "")[-300:])
+    return final_path
+
+
+def pick_relay_formats(formats, max_height=1080):
+    """Pilih format video & audio terbaik untuk jalur relay (HLS/DASH https)."""
+    videos = [f for f in formats if f.get("vcodec") and f["vcodec"] != "none"
+              and (f.get("protocol") in ("m3u8", "m3u8_native", "https", "http"))]
+    audios = [f for f in formats if f.get("acodec") and f["acodec"] != "none"
+              and (f.get("protocol") in ("m3u8", "m3u8_native", "https", "http"))]
+
+    def score(f):
+        h = f.get("height") or 0
+        res_rank = -abs(min(h or 720, max_height) - 720)
+        m3u8 = 50 if f.get("protocol") in ("m3u8", "m3u8_native") else 0
+        avc = 30 if "avc1" in (f.get("vcodec") or "") else 0
+        return (avc, m3u8, h, res_rank)
+
+    v = sorted(videos, key=score, reverse=True)[0] if videos else None
+    a = sorted(audios, key=score, reverse=True)[0] if audios else None
+    return v, a
+
+
+def download_via_relay(target, log=None):
+    """Strategi terakhir: unduh video LEWAT Cloudflare Worker (IP non-blokir)."""
+    if not FETCH_PROXY:
+        raise RuntimeError("YT_FETCH_PROXY belum diatur (env/Secrets yt_fetch_proxy).")
+    if log:
+        log(f"☁️ Relay Cloudflare aktif — ekstrak format untuk {target} ...")
+    ydl_opts = {"quiet": True, "no_warnings": True, "skip_download": True,
+                "noplaylist": True}
+    if FFMPEG:
+        ydl_opts["ffmpeg_location"] = FFMPEG
+    with YoutubeDL(ydl_opts) as y:
+        info = y.extract_info(target, download=False)
+    fmts = info.get("formats") or []
+    v, a = pick_relay_formats(fmts)
+    if not v:
+        raise RuntimeError("Tidak ada format video yang bisa direlay.")
+    if log:
+        log(f"☁️ Format dipilih: video {v.get('format_id')} "
+            f"({v.get('height')}p, {v.get('protocol')})"
+            + (f" + audio {a.get('format_id')}" if a else ""))
+    vfile, vsize = _pull_format(v, "v", log=log)
+    afile = None
+    if a:
+        afile, asize = _pull_format(a, "a", log=log)
+    final = os.path.join(WORK, f"relay_{fmt_slug(info.get('title','video'))}.mp4")
+    if log:
+        log(f"🎞️ Merapikan & menggabungkan via ffmpeg ...")
+    _relay_finish(vfile, afile, final, log=log)
+    for p in (vfile, afile):
+        if p and os.path.exists(p):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    if log:
+        log(f"✅ Relay selesai → {os.path.basename(final)} "
+            f"({fmt_size(os.path.getsize(final))})")
+    return final
+
+
+def fmt_slug(text):
+    s = re.sub(r"[^\w\s-]", "", text or "video")
+    s = re.sub(r"[\s_]+", "-", s).strip("-").lower()
+    return s[:60] or "video"
 
 
 # ---------------- UPLOAD GOFILE ----------------
